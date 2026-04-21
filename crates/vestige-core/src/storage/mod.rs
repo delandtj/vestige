@@ -1,16 +1,24 @@
 //! Storage Module
 //!
-//! SQLite-based storage layer with:
-//! - FTS5 full-text search with query sanitization
-//! - Embedded vector storage
-//! - FSRS-6 state management
-//! - Temporal memory support
+//! Backend-agnostic memory store abstraction plus SQLite reference impl.
 
+mod memory_store;
 mod migrations;
 mod sqlite;
 
+pub use memory_store::{
+    ClassificationResult, Domain, HealthStatus, LocalMemoryStore, MemoryEdge, MemoryRecord,
+    MemoryStore, MemoryStoreError, MemoryStoreResult, ModelSignature, SchedulingState,
+    SearchQuery, SearchResult, StoreStats,
+};
 pub use migrations::MIGRATIONS;
 pub use sqlite::{
     ConnectionRecord, ConsolidationHistoryRecord, DreamHistoryRecord, InsightRecord,
-    IntentionRecord, Result, SmartIngestResult, StateTransitionRecord, Storage, StorageError,
+    IntentionRecord, Result, SmartIngestResult, SqliteMemoryStore, StateTransitionRecord,
+    StorageError,
 };
+
+/// Backwards-compatibility alias. Retained until Phase 4 completes so every
+/// existing `Arc<Storage>` call site keeps compiling. Scheduled for removal
+/// once no downstream source file references it.
+pub type Storage = SqliteMemoryStore;

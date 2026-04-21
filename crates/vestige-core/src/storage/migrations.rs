@@ -59,6 +59,11 @@ pub const MIGRATIONS: &[Migration] = &[
         description: "v2.0.7 Cleanup: drop dead knowledge_edges and compressed_memories tables",
         up: MIGRATION_V11_UP,
     },
+    Migration {
+        version: 12,
+        description: "Phase 1: embedding_model registry, domains/domain_scores columns, domains table",
+        up: MIGRATION_V12_UP,
+    },
 ];
 
 /// A database migration
@@ -691,6 +696,54 @@ pub fn get_current_version(conn: &rusqlite::Connection) -> rusqlite::Result<u32>
     .or(Ok(0))
 }
 
+/// V12: Phase 1 - embedding_model registry + domain columns.
+///
+/// The ALTER TABLE statements are split out into `MIGRATION_V12_ALTER_COLUMNS`
+/// because SQLite has no `ALTER TABLE ... ADD COLUMN IF NOT EXISTS`. The
+/// migration runner handles them individually so replaying V12 is idempotent.
+const MIGRATION_V12_UP: &str = r#"
+-- Migration V12: embedding model registry + per-memory domain columns.
+
+-- 1. Embedding model registry. Single logical row; the (id = 1) constraint is
+--    enforced in code via `register_model` (SQLite CHECK on a single-row
+--    table is uglier than a constraint we already enforce in Rust).
+CREATE TABLE IF NOT EXISTS embedding_model (
+    id           INTEGER PRIMARY KEY CHECK (id = 1),
+    name         TEXT    NOT NULL,
+    dimension    INTEGER NOT NULL,
+    hash         TEXT    NOT NULL,
+    created_at   TEXT    NOT NULL
+);
+
+-- 2. Per-memory domain columns are applied separately (see apply_migrations).
+
+-- 3. Index on the domains JSON column to enable LIKE-style filter in Phase 4.
+CREATE INDEX IF NOT EXISTS idx_nodes_domains        ON knowledge_nodes(domains);
+CREATE INDEX IF NOT EXISTS idx_nodes_domain_scores  ON knowledge_nodes(domain_scores);
+
+-- 4. Domains catalogue (empty until Phase 4 populates).
+CREATE TABLE IF NOT EXISTS domains (
+    id           TEXT    PRIMARY KEY,
+    label        TEXT    NOT NULL,
+    centroid     BLOB,
+    top_terms    TEXT    NOT NULL DEFAULT '[]',
+    memory_count INTEGER NOT NULL DEFAULT 0,
+    created_at   TEXT    NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_domains_created_at ON domains(created_at);
+
+UPDATE schema_version SET version = 12, applied_at = datetime('now');
+"#;
+
+/// The two ALTER TABLE statements for V12. Kept separate so the migration
+/// runner can try each individually and ignore "duplicate column" errors,
+/// making V12 idempotent on replay (SQLite has no ADD COLUMN IF NOT EXISTS).
+pub const MIGRATION_V12_ALTER_COLUMNS: &[&str] = &[
+    "ALTER TABLE knowledge_nodes ADD COLUMN domains       TEXT NOT NULL DEFAULT '[]'",
+    "ALTER TABLE knowledge_nodes ADD COLUMN domain_scores TEXT NOT NULL DEFAULT '{}'",
+];
+
 /// Apply pending migrations
 pub fn apply_migrations(conn: &rusqlite::Connection) -> rusqlite::Result<u32> {
     let current_version = get_current_version(conn)?;
@@ -703,6 +756,26 @@ pub fn apply_migrations(conn: &rusqlite::Connection) -> rusqlite::Result<u32> {
                 migration.version,
                 migration.description
             );
+
+            // V12 adds columns via ALTER TABLE, which SQLite does not support
+            // with IF NOT EXISTS. Run them individually and ignore
+            // "duplicate column name" errors so the migration is idempotent
+            // on replay (e.g. after a schema_version rollback in tests).
+            if migration.version == 12 {
+                for stmt in MIGRATION_V12_ALTER_COLUMNS {
+                    if let Err(e) = conn.execute_batch(stmt) {
+                        let msg = e.to_string();
+                        if msg.contains("duplicate column name") {
+                            tracing::debug!(
+                                "V12 ALTER TABLE skipped (column already exists): {}",
+                                msg
+                            );
+                        } else {
+                            return Err(e);
+                        }
+                    }
+                }
+            }
 
             // Use execute_batch to handle multi-statement SQL including triggers
             conn.execute_batch(migration.up)?;
@@ -736,9 +809,9 @@ mod tests {
         // Pre-requisite: schema_version must be bootstrapped by V1.
         apply_migrations(&conn).expect("apply_migrations succeeds");
 
-        // 1. schema_version advanced to V11
+        // 1. schema_version advanced to the latest migration (currently V12)
         let version = get_current_version(&conn).expect("read schema_version");
-        assert_eq!(version, 11, "schema_version must be 11 after all migrations");
+        assert_eq!(version, 12, "schema_version must be 12 after all migrations");
 
         // 2. knowledge_edges is gone (V11 drops it)
         let knowledge_edges_rows: i64 = conn
@@ -782,10 +855,117 @@ mod tests {
         conn.execute("UPDATE schema_version SET version = 10", [])
             .expect("rewind schema_version");
 
-        // Replay must not error.
-        apply_migrations(&conn).expect("V11 replay must be idempotent");
+        // Replay V11 (and V12 which follows it). V11 uses DROP TABLE IF EXISTS
+        // so it is idempotent. V12 ALTER TABLE idempotency is handled by the
+        // migration runner (see apply_migrations).
+        apply_migrations(&conn).expect("V11+V12 replay must be idempotent");
 
+        // After replaying from V10, the schema advances to the latest version (V12).
         let version = get_current_version(&conn).expect("read schema_version");
-        assert_eq!(version, 11, "schema_version back at 11 after replay");
+        assert_eq!(version, 12, "schema_version at 12 after replay from V10");
+    }
+
+    #[test]
+    fn v12_adds_embedding_model_table() {
+        let conn = rusqlite::Connection::open_in_memory().expect("open in-memory");
+        apply_migrations(&conn).expect("apply_migrations");
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='embedding_model'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("query sqlite_master");
+        assert_eq!(count, 1, "embedding_model table must exist after V12");
+    }
+
+    #[test]
+    fn v12_adds_domains_columns() {
+        let conn = rusqlite::Connection::open_in_memory().expect("open in-memory");
+        apply_migrations(&conn).expect("apply_migrations");
+        let info: Vec<String> = {
+            let mut stmt = conn
+                .prepare("PRAGMA table_info(knowledge_nodes)")
+                .expect("prepare");
+            stmt.query_map([], |row| row.get::<_, String>(1))
+                .expect("query_map")
+                .map(|r| r.expect("row"))
+                .collect()
+        };
+        assert!(info.contains(&"domains".to_string()), "domains column missing");
+        assert!(info.contains(&"domain_scores".to_string()), "domain_scores column missing");
+    }
+
+    #[test]
+    fn v12_default_values_empty_json() {
+        let conn = rusqlite::Connection::open_in_memory().expect("open in-memory");
+        apply_migrations(&conn).expect("apply_migrations");
+        // Insert a minimal row to test defaults
+        conn.execute(
+            "INSERT INTO knowledge_nodes (id, content, node_type, created_at, updated_at, last_accessed, \
+             stability, difficulty, reps, lapses, learning_state, storage_strength, retrieval_strength, \
+             retention_strength, next_review, scheduled_days, has_embedding) \
+             VALUES ('test-id','content','fact',datetime('now'),datetime('now'),datetime('now'),\
+             1.0,0.3,0,0,'new',1.0,1.0,1.0,datetime('now'),1,0)",
+            [],
+        ).expect("insert row");
+        let (domains, domain_scores): (String, String) = conn
+            .query_row(
+                "SELECT domains, domain_scores FROM knowledge_nodes WHERE id='test-id'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("query row");
+        assert_eq!(domains, "[]");
+        assert_eq!(domain_scores, "{}");
+    }
+
+    #[test]
+    fn v12_is_replayable() {
+        let conn = rusqlite::Connection::open_in_memory().expect("open in-memory");
+        apply_migrations(&conn).expect("first apply");
+        // Rewind to V11 so V12 runs again
+        conn.execute("UPDATE schema_version SET version = 11", [])
+            .expect("rewind");
+        // V12 uses CREATE TABLE IF NOT EXISTS -- replay must not error
+        apply_migrations(&conn).expect("V12 replay must be idempotent");
+        let version = get_current_version(&conn).expect("read version");
+        assert_eq!(version, 12, "schema_version must be 12 after replay");
+    }
+
+    #[test]
+    fn v12_preserves_existing_rows() {
+        let conn = rusqlite::Connection::open_in_memory().expect("open in-memory");
+        // Apply up to V11 only
+        for migration in MIGRATIONS {
+            if migration.version <= 11 {
+                conn.execute_batch(migration.up).expect("apply migration");
+            }
+        }
+        // Insert a row under V11 schema
+        conn.execute(
+            "INSERT INTO knowledge_nodes (id, content, node_type, created_at, updated_at, last_accessed, \
+             stability, difficulty, reps, lapses, learning_state, storage_strength, retrieval_strength, \
+             retention_strength, next_review, scheduled_days, has_embedding) \
+             VALUES ('existing-id','old content','fact',datetime('now'),datetime('now'),datetime('now'),\
+             1.0,0.3,0,0,'new',1.0,1.0,1.0,datetime('now'),1,0)",
+            [],
+        ).expect("insert pre-v12 row");
+        // Apply V12: run the ALTER TABLE statements first (they are kept separate
+        // from MIGRATION_V12_UP because SQLite has no ADD COLUMN IF NOT EXISTS).
+        for stmt in MIGRATION_V12_ALTER_COLUMNS {
+            conn.execute_batch(stmt).expect("apply V12 ALTER TABLE");
+        }
+        conn.execute_batch(MIGRATION_V12_UP).expect("apply V12 main");
+        // Check the old row has defaults
+        let (domains, domain_scores): (String, String) = conn
+            .query_row(
+                "SELECT domains, domain_scores FROM knowledge_nodes WHERE id='existing-id'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("query pre-v12 row");
+        assert_eq!(domains, "[]");
+        assert_eq!(domain_scores, "{}");
     }
 }
